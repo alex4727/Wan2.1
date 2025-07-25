@@ -306,7 +306,8 @@ class WanVace(WanT2V):
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 disable_tqdm=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -426,7 +427,7 @@ class WanVace(WanT2V):
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for _, t in enumerate(tqdm(timesteps, disable=disable_tqdm)):
                 latent_model_input = latents
                 timestep = [t]
 

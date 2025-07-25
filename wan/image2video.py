@@ -141,7 +141,8 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 disable_tqdm=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -299,7 +300,7 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            for _, t in enumerate(tqdm(timesteps, disable=disable_tqdm)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
