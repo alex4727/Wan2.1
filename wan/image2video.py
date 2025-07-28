@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
@@ -27,6 +28,114 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+
+# ============== ALG (Adaptive Low-Pass Guidance) Utilities ==============
+
+def apply_alg_low_pass_filter(
+    tensor: torch.Tensor,
+    filter_type: str,
+    blur_sigma: float = None,
+    blur_kernel_size: float = None,
+    resize_factor: float = None,
+):
+    """
+    Applies the specified low-pass filtering operation to the input tensor.
+    Handles 4D ([B, C, H, W]) and 5D ([B, C, F, H, W]) tensors by temporarily
+    reshaping 5D tensors for spatial filtering.
+    """
+    # Early exits for no-op cases
+    if filter_type == "none":
+        return tensor
+    if filter_type == "down_up" and resize_factor == 1.0:
+        return tensor
+    if filter_type == "gaussian_blur" and blur_sigma == 0:
+        return tensor
+
+    # Reshape 5D tensor for spatial filtering
+    is_5d = tensor.ndim == 5
+    if is_5d:
+        B, C, K, H, W = tensor.shape
+        # Flatten frames into batch dimension using view
+        tensor = tensor.view(B * K, C, H, W)
+    else:
+        B, C, H, W = tensor.shape
+
+    # Apply selected filter
+    if filter_type == "gaussian_blur":
+        if isinstance(blur_kernel_size, float):
+            kernel_val = max(int(blur_kernel_size * H), 1)
+        else:
+            kernel_val = int(blur_kernel_size)
+        if kernel_val % 2 == 0:
+            kernel_val += 1
+        # Use torchvision's gaussian_blur
+        import torchvision.transforms.functional as tvF
+        tensor = tvF.gaussian_blur(tensor, kernel_size=[kernel_val, kernel_val], sigma=[blur_sigma, blur_sigma])
+
+    elif filter_type == "down_up":
+        h0, w0 = tensor.shape[-2:]
+        h1 = max(1, int(round(h0 * resize_factor)))
+        w1 = max(1, int(round(w0 * resize_factor)))
+        tensor = F.interpolate(tensor, size=(h1, w1), mode="bilinear", align_corners=False, antialias=True)
+        tensor = F.interpolate(tensor, size=(h0, w0), mode="bilinear", align_corners=False, antialias=True)
+
+    # Restore original 5D shape if necessary
+    if is_5d:
+        tensor = tensor.view(B, C, K, H, W)
+
+    return tensor
+
+
+def get_alg_lp_strength(
+    step_index: int,
+    total_steps: int,
+    lp_strength_schedule_type: str,
+    # Interval params
+    schedule_interval_start_time: float = 0.0,
+    schedule_interval_end_time: float = 0.05,
+    # Linear params
+    schedule_linear_start_weight: float = 1.0,
+    schedule_linear_end_weight: float = 0.0,
+    schedule_linear_end_time: float = 0.5,
+    # Exponential params
+    schedule_exp_decay_rate: float = 10.0,
+) -> float:
+    """
+    Calculates the low-pass guidance strength multiplier for the current timestep
+    based on the specified schedule.
+    """
+    step_norm = step_index / max(total_steps - 1, 1)
+
+    if lp_strength_schedule_type == "linear":
+        schedule_duration_fraction = schedule_linear_end_time
+        if schedule_duration_fraction <= 0:
+            return schedule_linear_start_weight
+        if step_norm >= schedule_duration_fraction:
+            current_strength = schedule_linear_end_weight
+        else:
+            progress = step_norm / schedule_duration_fraction
+            current_strength = schedule_linear_start_weight * (1 - progress) + schedule_linear_end_weight * progress
+        return current_strength
+
+    elif lp_strength_schedule_type == "interval":
+        if schedule_interval_start_time <= step_norm <= schedule_interval_end_time:
+            return 1.0
+        else:
+            return 0.0
+
+    elif lp_strength_schedule_type == "exponential":
+        decay_rate = schedule_exp_decay_rate
+        if decay_rate < 0:
+            logging.warning(f"Warning: Negative exponential_decay_rate ({decay_rate}) is unusual. Using abs value.")
+            decay_rate = abs(decay_rate)
+        return math.exp(-decay_rate * step_norm)
+
+    elif lp_strength_schedule_type == "none":
+        return 1.0
+    else:
+        logging.warning(f"Warning: Unknown lp_strength_schedule_type '{lp_strength_schedule_type}'. Using constant strength 1.0.")
+        return 1.0
 
 
 class WanI2V:
@@ -130,6 +239,70 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
+    def _prepare_alg_lp_condition(self,
+                                  orig_image,
+                                  y_condition,
+                                  msk,
+                                  frame_num,
+                                  h, w,
+                                  lp_filter_type,
+                                  lp_filter_in_latent,
+                                  lp_blur_sigma,
+                                  lp_blur_kernel_size,
+                                  lp_resize_factor,
+                                  seed_g):
+        """
+        Prepares low-pass filtered condition for ALG.
+        
+        Args:
+            orig_image: Original input image tensor [C, H, W]
+            y_condition: VAE-encoded condition with mask [20, frames//4+1, lat_h, lat_w]
+            msk: Mask tensor [4, frames//4+1, lat_h, lat_w]
+            frame_num: Number of frames
+            h, w: Height and width  
+            lp_filter_type: Type of low-pass filter
+            lp_filter_in_latent: Whether to filter in latent space
+            lp_blur_sigma: Gaussian blur sigma
+            lp_blur_kernel_size: Gaussian blur kernel size
+            lp_resize_factor: Resize factor for down-up filtering
+            seed_g: Random generator
+            
+        Returns:
+            Low-pass filtered condition tensor
+        """
+        if not lp_filter_in_latent:
+            # Filter in image space
+            image_lp = apply_alg_low_pass_filter(
+                orig_image.unsqueeze(0),  # Add batch dimension
+                filter_type=lp_filter_type,
+                blur_sigma=lp_blur_sigma,
+                blur_kernel_size=lp_blur_kernel_size,
+                resize_factor=lp_resize_factor,
+            ).squeeze(0)  # Remove batch dimension
+            
+            # Prepare video tensor with filtered first frame
+            video_lp = torch.concat([
+                F.interpolate(image_lp[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
+                torch.zeros(3, frame_num - 1, h, w)
+            ], dim=1).to(self.device)
+            
+            # Encode through VAE - Note: Wan2.1's VAE doesn't expose latent_dist.sample()
+            # so we use the direct output, which is already normalized in Wan's implementation
+            y_lp = self.vae.encode([video_lp])[0]
+            y_lp_condition = torch.concat([msk, y_lp])
+        else:
+            # Filter in latent space - filter the ENTIRE condition tensor (mask + latents)
+            # This matches the diffusers implementation exactly
+            y_lp_condition = apply_alg_low_pass_filter(
+                y_condition.unsqueeze(0),  # Add batch dimension
+                filter_type=lp_filter_type,
+                blur_sigma=lp_blur_sigma,
+                blur_kernel_size=lp_blur_kernel_size,
+                resize_factor=lp_resize_factor,
+            ).squeeze(0)  # Remove batch dimension
+            
+        return y_lp_condition
+
     def generate(self,
                  input_prompt,
                  img,
@@ -142,7 +315,9 @@ class WanI2V:
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
-                 disable_tqdm=False):
+                 disable_tqdm=False,
+                 use_alg=False,
+                 alg_kwargs=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -170,6 +345,10 @@ class WanI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            use_alg (`bool`, *optional*, defaults to False):
+                If True, enables Adaptive Low-Pass Guidance (ALG) for improved motion dynamics
+            alg_kwargs (`dict`, *optional*, defaults to None):
+                ALG configuration parameters. If None, uses default values
 
         Returns:
             torch.Tensor:
@@ -179,6 +358,24 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        # Set default ALG kwargs matching diffusers wan_alg.yaml config
+        # These are the ACTUAL ALG defaults from configs/wan_alg.yaml
+        if alg_kwargs is None:
+            alg_kwargs = {
+                'lp_filter_type': 'down_up',
+                'lp_filter_in_latent': True,
+                'lp_blur_sigma': 15.0,  # Not used with down_up
+                'lp_blur_kernel_size': 0.02734375,  # Not used with down_up
+                'lp_resize_factor': 0.4,
+                'lp_strength_schedule_type': 'interval',
+                'schedule_blur_kernel_size': False,
+                'schedule_interval_start_time': 0.0,
+                'schedule_interval_end_time': 0.20,
+                'schedule_linear_start_weight': 1.0,  # Not used with interval
+                'schedule_linear_end_weight': 0.0,  # Not used with interval
+                'schedule_linear_end_time': 0.5,  # Not used with interval
+                'schedule_exp_decay_rate': 10.0,  # Not used with interval
+            }
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
@@ -300,24 +497,115 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps, disable=disable_tqdm)):
+            for step_idx, t in enumerate(tqdm(timesteps, disable=disable_tqdm)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
                 timestep = torch.stack(timestep).to(self.device)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                # ALG: Compute low-pass strength and prepare conditions
+                if guide_scale > 1.0 and use_alg:
+                    lp_strength = get_alg_lp_strength(
+                        step_index=step_idx,
+                        total_steps=sampling_steps,
+                        lp_strength_schedule_type=alg_kwargs['lp_strength_schedule_type'],
+                        schedule_interval_start_time=alg_kwargs['schedule_interval_start_time'],
+                        schedule_interval_end_time=alg_kwargs['schedule_interval_end_time'],
+                        schedule_linear_start_weight=alg_kwargs['schedule_linear_start_weight'],
+                        schedule_linear_end_weight=alg_kwargs['schedule_linear_end_weight'],
+                        schedule_linear_end_time=alg_kwargs['schedule_linear_end_time'],
+                        schedule_exp_decay_rate=alg_kwargs['schedule_exp_decay_rate'],
+                    )
+                    
+                    if lp_strength > 0.0:
+                        # Modulate filter parameters based on strength
+                        modulated_lp_blur_sigma = alg_kwargs['lp_blur_sigma'] * lp_strength
+                        modulated_lp_blur_kernel_size = (
+                            alg_kwargs['lp_blur_kernel_size'] * lp_strength 
+                            if alg_kwargs['schedule_blur_kernel_size'] 
+                            else alg_kwargs['lp_blur_kernel_size']
+                        )
+                        modulated_lp_resize_factor = 1.0 - (1.0 - alg_kwargs['lp_resize_factor']) * lp_strength
+                        
+                        # Prepare low-pass filtered condition
+                        y_lp_condition = self._prepare_alg_lp_condition(
+                            orig_image=img,
+                            y_condition=y,
+                            msk=msk,
+                            frame_num=F,
+                            h=h, w=w,
+                            lp_filter_type=alg_kwargs['lp_filter_type'],
+                            lp_filter_in_latent=alg_kwargs['lp_filter_in_latent'],
+                            lp_blur_sigma=modulated_lp_blur_sigma,
+                            lp_blur_kernel_size=modulated_lp_blur_kernel_size,
+                            lp_resize_factor=modulated_lp_resize_factor,
+                            seed_g=seed_g
+                        )
+                        
+                        # Three-pass inference for ALG
+                        # Pass 1: Unconditional with original condition
+                        noise_pred_uncond_orig = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        
+                        # Pass 2: Unconditional with low-pass condition
+                        arg_null_lp = {
+                            'context': context_null,
+                            'clip_fea': clip_context,
+                            'seq_len': max_seq_len,
+                            'y': [y_lp_condition],
+                        }
+                        noise_pred_uncond_lp = self.model(
+                            latent_model_input, t=timestep, **arg_null_lp)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        
+                        # Pass 3: Conditional with low-pass condition
+                        arg_c_lp = {
+                            'context': [context[0]],
+                            'clip_fea': clip_context,
+                            'seq_len': max_seq_len,
+                            'y': [y_lp_condition],
+                        }
+                        noise_pred_cond_lp = self.model(
+                            latent_model_input, t=timestep, **arg_c_lp)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        
+                        # Combine predictions using ALG formula
+                        noise_pred = noise_pred_uncond_orig + guide_scale * (noise_pred_cond_lp - noise_pred_uncond_lp)
+                    else:
+                        # Standard two-pass CFG when lp_strength = 0
+                        noise_pred_cond = self.model(
+                            latent_model_input, t=timestep, **arg_c)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred = noise_pred_uncond + guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+                else:
+                    # Standard two-pass CFG when ALG is disabled
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
                 latent = latent.to(
                     torch.device('cpu') if offload_model else self.device)
